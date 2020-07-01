@@ -8,8 +8,7 @@
   docker_image: 
     name: gencert-for-k8s-hardway
     build:
-      path: /home/phchoi/git/k8s/gencert-for-k8s-hardway/docker
-      #path: /home/phchoi/git/k8s/gencert-for-k8s-hardway.dockerfile/
+      path: "{{ role_path }}/docker"
     state: present
     source: build
 
