@@ -1,0 +1,4 @@
+---
+# defaults file for gencert-for-k8s-hardway
+
+local_temp: /tmp

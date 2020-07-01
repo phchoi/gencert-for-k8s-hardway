@@ -1,0 +1,343 @@
+---
+# tasks file for gencert-for-k8s-hardway
+#- name: test debug
+#  debug: msg="{{ item.key }}"
+#  with_dict: "{{ worker_instances }}"
+
+- name: build image from dockerfile
+  docker_image: 
+    name: gencert-for-k8s-hardway
+    build:
+      path: /home/phchoi/git/k8s/gencert-for-k8s-hardway/docker
+      #path: /home/phchoi/git/k8s/gencert-for-k8s-hardway.dockerfile/
+    state: present
+    source: build
+
+- name: start container
+  docker_container:
+    name: gencert-for-k8s-hardway
+    image: gencert-for-k8s-hardway
+    state: started
+    interactive: yes
+    command: /bin/bash
+    tty: yes
+
+- name: create local_temp directory
+  file:
+    path: "{{ local_temp }}"
+    state: directory
+    mode: 0755
+
+- name: copy file to temp location before doing docker cp
+  copy:
+    src: "{{ item }}"
+    dest: "{{ local_temp }}"
+  with_items:
+    - admin-csr.json
+    - ca-config.json
+    - ca-csr.json
+    - kube-controller-manager-csr.json
+    - kube-proxy-csr.json
+    - kube-scheduler-csr.json
+    - kubernetes-csr.json
+    - service-account-csr.json
+
+- name: docker cp json to container
+  shell: "docker cp {{ local_temp }}/{{ item }} gencert-for-k8s-hardway:/tmp/"
+  with_items:
+    - admin-csr.json
+    - ca-config.json
+    - ca-csr.json
+    - kube-controller-manager-csr.json
+    - kube-proxy-csr.json
+    - kube-scheduler-csr.json
+    - kubernetes-csr.json
+    - service-account-csr.json
+
+# https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/04-certificate-authority.md#certificate-authority
+- name: Generate Certificate Authority
+  shell: >
+     docker exec -it gencert-for-k8s-hardway /bin/bash -c 
+     '/root/go/bin/cfssl gencert -initca /tmp/ca-csr.json | /root/go/bin/cfssljson -bare ca'
+
+# https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/04-certificate-authority.md#client-and-server-certificates
+- name: Generate Admin Client certificate
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c 
+    '/root/go/bin/cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=/tmp/ca-config.json -profile=kubernetes /tmp/admin-csr.json 
+    | /root/go/bin/cfssljson -bare admin'
+
+# https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/04-certificate-authority.md#the-kubelet-client-certificates
+- name: create worker instance csr file in json
+  template:
+    src: instance-csr.json.j2
+    dest: "{{ local_temp }}/{{ item.name }}-csr.json"
+  with_items: "{{ worker_instances }}"
+
+- name: docker cp worker instance json to container
+  shell: "docker cp {{ local_temp }}/{{ item.name }}-csr.json gencert-for-k8s-hardway:/tmp/"
+  with_items: "{{ worker_instances }}"
+
+- name: create worker instance client certificate
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c 
+    '/root/go/bin/cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=/tmp/ca-config.json 
+    -profile=kubernetes -hostname={{ item.name }},{{ item.public_ip }},{{ item.private_ip }} /tmp/{{ item.name }}-csr.json
+    | /root/go/bin/cfssljson -bare {{ item.name }}'
+  with_items: "{{ worker_instances }}"
+
+
+# https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/04-certificate-authority.md#the-controller-manager-client-certificate
+- name: create kube-controller-manager client certificate
+  shell: docker exec -it gencert-for-k8s-hardway /bin/bash -c '/root/go/bin/cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=/tmp/ca-config.json -profile=kubernetes /tmp/kube-controller-manager-csr.json | /root/go/bin/cfssljson -bare kube-controller-manager'
+
+# https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/04-certificate-authority.md#the-kube-proxy-client-certificate
+- name: create kube-proxy client certificate
+  shell: docker exec -it gencert-for-k8s-hardway /bin/bash -c '/root/go/bin/cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=/tmp/ca-config.json -profile=kubernetes /tmp/kube-proxy-csr.json | /root/go/bin/cfssljson -bare kube-proxy'
+
+# https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/04-certificate-authority.md#the-scheduler-client-certificate
+- name: create kube-scheduler client certificate
+  shell: docker exec -it gencert-for-k8s-hardway /bin/bash -c '/root/go/bin/cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=/tmp/ca-config.json -profile=kubernetes /tmp/kube-scheduler-csr.json | /root/go/bin/cfssljson -bare kube-scheduler'
+
+# https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/04-certificate-authority.md#the-kubernetes-api-server-certificate
+- name: concatenate service cluster hostname
+  set_fact:
+    service_cluster_hostname: "{{ service_cluster_hostname_list | join(',') }}"
+
+- name: concatenate api servers ip
+  set_fact:
+    api_servers: "{{ api_server_ip_list | join(',') }}"
+
+- name: set api server certificate hostname
+  set_fact:
+    api_server_hostname: "{{ service_cluster_api_ip }},{{ api_servers }},{{ service_cluster_hostname }},127.0.0.1"
+
+- name: debug api_server_hostname for kubernetes.pem
+  debug: msg="{{ api_server_hostname }}"
+
+- name: create kubernetes api server certificate
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    '/root/go/bin/cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=/tmp/ca-config.json
+    -hostname={{ api_server_hostname }} -profile=kubernetes /tmp/kubernetes-csr.json
+    | /root/go/bin/cfssljson -bare kubernetes'
+
+# https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/04-certificate-authority.md#the-service-account-key-pair
+- name: create service account key pair
+  shell: > 
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c 
+    '/root/go/bin/cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=/tmp/ca-config.json 
+    -profile=kubernetes /tmp/service-account-csr.json 
+    | /root/go/bin/cfssljson -bare service-account'
+
+# https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/04-certificate-authority.md#distribute-the-client-and-server-certificates
+- name: copy kubernetes ssl key and cert from docker to local 
+  shell: >
+    docker cp gencert-for-k8s-hardway:/{{ item }}.pem {{ local_temp }}
+  with_items:
+    - ca
+    - ca-key
+    - kubernetes
+    - kubernetes-key
+    - service-account
+    - service-account-key
+
+- name: copy worker's ssl key from docker to local 
+  shell: >
+    docker cp gencert-for-k8s-hardway:/{{ item.name }}.pem {{ local_temp }}
+  with_items: "{{ worker_instances }}"
+
+- name: copy worker's ssl cert from docker to local 
+  shell: >
+    docker cp gencert-for-k8s-hardway:/{{ item.name }}-key.pem {{ local_temp }}
+  with_items: "{{ worker_instances }}"
+
+
+# https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/05-kubernetes-configuration-files.md#the-kubelet-kubernetes-configuration-file
+- name: generate kubeconfig for worker node - set-cluster
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config set-cluster kubernetes-the-hard-way 
+    --certificate-authority=/ca.pem 
+    --embed-certs=true
+    --server=https://{{ k8s_api_public_address }}:6443 
+    --kubeconfig={{ item.name }}.kubeconfig'
+  with_items: "{{ worker_instances }}"
+
+- name: generate kubeconfig for worker node - set-credentials
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config set-credentials system:node:{{ item.name }} 
+    --client-certificate={{ item.name }}.pem 
+    --client-key={{ item.name }}-key.pem 
+    --embed-certs=true 
+    --kubeconfig={{ item.name }}.kubeconfig'
+  with_items: "{{ worker_instances }}"
+
+- name: generate kubeconfig for worker node - set-context
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config set-context default 
+    --cluster=kubernetes-the-hard-way 
+    --user=system:node:{{ item.name }} 
+    --kubeconfig={{ item.name }}.kubeconfig'
+  with_items: "{{ worker_instances }}"
+
+- name: generate kubeconfig for worker node - use-context
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config use-context default --kubeconfig={{ item.name }}.kubeconfig'
+  with_items: "{{ worker_instances }}"
+
+#https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/05-kubernetes-configuration-files.md#the-kube-proxy-kubernetes-configuration-file
+- name: generate kubeconfig for kube-proxy - set cluster
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config set-cluster kubernetes-the-hard-way 
+    --certificate-authority=ca.pem 
+    --embed-certs=true 
+    --server=https://{{ k8s_api_public_address }}:6443 
+    --kubeconfig=kube-proxy.kubeconfig'
+
+- name: generate kubeconfig for kube-proxy - set credential
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config set-credentials system:kube-proxy 
+    --client-certificate=kube-proxy.pem 
+    --client-key=kube-proxy-key.pem 
+    --embed-certs=true 
+    --kubeconfig=kube-proxy.kubeconfig'
+
+- name: generate kubeconfig for kube-proxy - set context
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config set-context default 
+    --cluster=kubernetes-the-hard-way 
+    --user=system:kube-proxy 
+    --kubeconfig=kube-proxy.kubeconfig'
+
+- name: generate kubeconfig for kube-proxy - use context
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config use-context default --kubeconfig=kube-proxy.kubeconfig'
+
+#https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/05-kubernetes-configuration-files.md#the-kube-controller-manager-kubernetes-configuration-file
+- name: generate kubeconfig for kube-controller-manager - set cluster
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config set-cluster kubernetes-the-hard-way 
+    --certificate-authority=ca.pem 
+    --embed-certs=true 
+    --server=https://127.0.0.1:6443 
+    --kubeconfig=kube-controller-manager.kubeconfig'
+
+- name: generate kubeconfig for kube-controller-manager - set credentials
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config set-credentials system:kube-controller-manager 
+    --client-certificate=kube-controller-manager.pem 
+    --client-key=kube-controller-manager-key.pem 
+    --embed-certs=true 
+    --kubeconfig=kube-controller-manager.kubeconfig'
+
+- name: generate kubeconfig for kube-controller-manager - set context
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config set-context default 
+    --cluster=kubernetes-the-hard-way 
+    --user=system:kube-controller-manager 
+    --kubeconfig=kube-controller-manager.kubeconfig'
+
+- name: generate kubeconfig for kube-controller-manager - use context
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config use-context default --kubeconfig=kube-controller-manager.kubeconfig'
+
+#https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/05-kubernetes-configuration-files.md#the-kube-scheduler-kubernetes-configuration-file
+- name: generate kubeconfig for kube-scheduler - set cluster
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config set-cluster kubernetes-the-hard-way 
+    --certificate-authority=ca.pem 
+    --embed-certs=true 
+    --server=https://127.0.0.1:6443 
+    --kubeconfig=kube-scheduler.kubeconfig'
+
+- name: generate kubeconfig for kube-scheduler - set credential
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config set-credentials system:kube-scheduler 
+    --client-certificate=kube-scheduler.pem 
+    --client-key=kube-scheduler-key.pem 
+    --embed-certs=true 
+    --kubeconfig=kube-scheduler.kubeconfig'
+
+- name: generate kubeconfig for kube-scheduler - set context
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config set-context default 
+    --cluster=kubernetes-the-hard-way 
+    --user=system:kube-scheduler 
+    --kubeconfig=kube-scheduler.kubeconfig'
+
+- name: generate kubeconfig for kube-scheduler - use context
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config use-context default --kubeconfig=kube-scheduler.kubeconfig'
+
+#https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/05-kubernetes-configuration-files.md#the-admin-kubernetes-configuration-file
+- name: generate kubeconfig for admin - set cluster
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config set-cluster kubernetes-the-hard-way 
+    --certificate-authority=ca.pem 
+    --embed-certs=true 
+    --server=https://127.0.0.1:6443 
+    --kubeconfig=admin.kubeconfig'
+
+- name: generate kubeconfig for admin - set credential
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config set-credentials admin 
+    --client-certificate=admin.pem 
+    --client-key=admin-key.pem 
+    --embed-certs=true 
+    --kubeconfig=admin.kubeconfig'
+
+- name: generate kubeconfig for admin - set context
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config set-context default 
+    --cluster=kubernetes-the-hard-way 
+    --user=admin 
+    --kubeconfig=admin.kubeconfig'
+
+- name: generate kubeconfig for admin - use context
+  shell: >
+    docker exec -it gencert-for-k8s-hardway /bin/bash -c
+    'kubectl config use-context default --kubeconfig=admin.kubeconfig'
+
+#https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/05-kubernetes-configuration-files.md#distribute-the-kubernetes-configuration-files
+- name: copy kubernetes worker config from docker to local 
+  shell: >
+    docker cp gencert-for-k8s-hardway:/{{ item.name }}.kubeconfig {{ local_temp }}
+  with_items: "{{ worker_instances }}"
+
+- name: copy kubernetes admin config from docker to local 
+  shell: >
+    docker cp gencert-for-k8s-hardway:/{{ item }}.kubeconfig {{ local_temp }}
+  with_items:
+    - kube-proxy
+    - admin
+    - kube-controller-manager
+    - kube-scheduler
+
+# https://github.com/kelseyhightower/kubernetes-the-hard-way/blob/master/docs/06-data-encryption-keys.md#the-encryption-config-file
+- name: create encryption config
+  template:
+    src: encryption-config.yaml.j2
+    dest: "{{ local_temp }}/encryption-config.yaml"
+
+#- name: copy encryption config from docker to local 
+#  shell: >
+#    docker cp gencert-for-k8s-hardway:/tmp/encryption-config.yaml /tmp/
